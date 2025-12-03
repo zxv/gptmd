@@ -129,6 +129,53 @@ def build_message_path(convo: Dict[str, Any]) -> List[str]:
     return path
 
 
+def get_sorted_children(
+    node_id: str, mapping: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    node = mapping.get(node_id) or {}
+    children = node.get("children") or []
+
+    def ts(cid: str) -> float:
+        m = (mapping.get(cid) or {}).get("message") or {}
+        return (
+            m.get("create_time")
+            or m.get("update_time")
+            or 0.0
+        )
+
+    return sorted(children, key=lambda cid: (ts(cid), cid))
+
+
+def message_from_node(
+    node_id: str,
+    mapping: Dict[str, Dict[str, Any]],
+    include_thoughts: bool,
+    include_tools: bool,
+    safe_urls: List[str],
+) -> Optional[Dict[str, Any]]:
+    node = mapping.get(node_id) or {}
+    msg = node.get("message")
+    if not msg:
+        return None
+    content = msg.get("content") or {}
+    ctype = content.get("content_type")
+    if ctype == "thoughts" and not include_thoughts:
+        return None
+    if ctype == "code" and not include_tools:
+        return None
+    text = render_content(content, safe_urls)
+    if not text.strip():
+        return None
+    metadata = msg.get("metadata") or {}
+    return {
+        "role": (msg.get("author") or {}).get("role") or "unknown",
+        "text": text,
+        "content_type": ctype,
+        "create_time": msg.get("create_time"),
+        "model": metadata.get("model_slug") or metadata.get("default_model_slug"),
+    }
+
+
 def resolve_citation_block(refs: List[str], safe_urls: List[str], ref_map: Dict[str, str], url_iter) -> str:
     links: List[str] = []
     for ref in refs:
@@ -214,29 +261,9 @@ def extract_messages(
     messages: List[Dict[str, Any]] = []
     safe_urls = convo.get("safe_urls") or []
     for node_id in ordered_ids:
-        node = mapping.get(node_id) or {}
-        msg = node.get("message")
-        if not msg:
-            continue
-        content = msg.get("content") or {}
-        ctype = content.get("content_type")
-        if ctype == "thoughts" and not include_thoughts:
-            continue
-        if ctype == "code" and not include_tools:
-            continue
-        text = render_content(content, safe_urls)
-        if not text.strip():
-            continue
-        metadata = msg.get("metadata") or {}
-        messages.append(
-            {
-                "role": (msg.get("author") or {}).get("role") or "unknown",
-                "text": text,
-                "content_type": ctype,
-                "create_time": msg.get("create_time"),
-                "model": metadata.get("model_slug") or metadata.get("default_model_slug"),
-            }
-        )
+        msg = message_from_node(node_id, mapping, include_thoughts, include_tools, safe_urls)
+        if msg:
+            messages.append(msg)
     return messages
 
 
@@ -305,6 +332,10 @@ def write_export(
 ) -> None:
     Path(outdir).mkdir(parents=True, exist_ok=True)
     for convo in convos:
+        mapping = convo.get("mapping") or {}
+        safe_urls = convo.get("safe_urls") or []
+        main_path = build_message_path(convo)
+        main_set = set(main_path)
         messages = extract_messages(convo, include_thoughts, include_tools)
         title = convo.get("title") or "Untitled"
         ts = convo.get("create_time") or convo.get("update_time")
@@ -324,7 +355,7 @@ def write_export(
         ]
         if default_model:
             lines.insert(4, f"- Default model: {default_model}")
-        for msg in messages:
+        def render_message(msg: Dict[str, Any]) -> None:
             time_label = fmt_timestamp(msg.get("create_time"), use_utc)
             role = msg.get("role") or "unknown"
             model_note = f" [{msg['model']}]" if msg.get("model") else ""
@@ -333,6 +364,47 @@ def write_export(
             lines.append("")
             lines.append(body)
             lines.append("")
+
+        visited_branch: set = set()
+
+        def render_branch_iter(start_id: str, depth: int, label: str) -> None:
+            stack: List[Tuple[str, int, str]] = [(start_id, depth, label)]
+            while stack:
+                node_id, d, lbl = stack.pop()
+                if node_id in visited_branch:
+                    continue
+                visited_branch.add(node_id)
+                heading_level = min(6, 2 + d)
+                msg = message_from_node(node_id, mapping, include_thoughts, include_tools, safe_urls)
+                child_first_msg = msg
+                if not msg:
+                    for cid in get_sorted_children(node_id, mapping):
+                        child_first_msg = message_from_node(cid, mapping, include_thoughts, include_tools, safe_urls)
+                        if child_first_msg:
+                            break
+                heading_label = "Alternate branch"
+                if lbl:
+                    heading_label += f" {lbl}"
+                if child_first_msg:
+                    ts_label = fmt_timestamp(child_first_msg.get("create_time"), use_utc)
+                    heading_label += f" (from {child_first_msg.get('role','unknown')} @ {ts_label})"
+                lines.append(f"{'#' * heading_level} {heading_label}")
+                lines.append("")
+                if msg:
+                    render_message(msg)
+                children = get_sorted_children(node_id, mapping)
+                for child_id in reversed(children):
+                    stack.append((child_id, d + 1, ""))
+
+        # Render main path with inline alternate branches
+        for node_id in main_path:
+            msg = message_from_node(node_id, mapping, include_thoughts, include_tools, safe_urls)
+            if msg:
+                render_message(msg)
+            children = get_sorted_children(node_id, mapping)
+            alt_children = [cid for cid in children if cid not in main_set]
+            for idx, cid in enumerate(alt_children, start=1):
+                render_branch_iter(cid, depth=1, label=str(idx))
         with filepath.open("w", encoding="utf-8") as fh:
             fh.write("\n".join(lines).rstrip() + "\n")
 
